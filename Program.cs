@@ -1,92 +1,54 @@
-using System.Reflection;
-using System.Text;
-using System.Text.Json.Serialization;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
-using Microsoft.OpenApi.Models;
-using RaceDay.Api.Data;
-using RaceDay.Api.Services;
+using Microsoft.AspNetCore.Mvc;
+using RaceDay.Web.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddDbContext<RaceDayDbContext>(o =>
-    o.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
-builder.Services.AddScoped<TokenService>();
-builder.Services.AddSingleton<BlobStorageService>();
-builder.Services.AddHttpClient<WeatherService>(c => c.BaseAddress = new Uri("https://api.open-meteo.com/"));
+builder.Services.AddControllersViews();
 
-builder.Services.AddControllers()
-    .AddJsonOptions(o => o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(o =>
-    {
-        o.MapInboundClaims = false;
-        o.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = builder.Configuration["Jwt:Issuer"],
-            ValidAudience = builder.Configuration["Jwt:Audience"],
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Key"]!)),
-            RoleClaimType = "role",
-            NameClaimType = "name",
-            ClockSkew = TimeSpan.FromSeconds(30)
-        };
-    });
-builder.Services.AddAuthorization();
-
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
+// Session: keeps the JWT, refresh token, role and display name between requests.
+builder.Services.AddDistributedMemoryCache();
+builder.Services.AddSession(o =>
 {
-    c.SwaggerDoc("v1", new OpenApiInfo
-    {
-        Title = "RaceDay API",
-        Version = "v1",
-        Description = "API for managing Run / Walk / Cycle events, categories, enrolments and results. " +
-                      "Roles: Organiser and Participant. Log in, then click Authorize and paste the accessToken."
-    });
-    var xml = Path.Combine(AppContext.BaseDirectory, $"{Assembly.GetExecutingAssembly().GetName().Name}.xml");
-    if (File.Exists(xml)) c.IncludeXmlComments(xml);
+    o.IdleTimeout = TimeSpan.FromMinutes(30);
+    o.Cookie.Name = ".RaceDay.Session";
+    o.Cookie.HttpOnly = true;
+    o.Cookie.IsEssential = true;
+    o.Cookie.SameSite = SameSiteMode.Lax;
+});
+builder.Services.AddHttpContextAccessor();
 
-    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
-    {
-        Name = "Authorization",
-        Type = SecuritySchemeType.Http,
-        Scheme = "bearer",
-        BearerFormat = "JWT",
-        In = ParameterLocation.Header,
-        Description = "Paste the accessToken returned by POST /api/auth/login (no 'Bearer ' prefix)."
-    });
-    c.AddSecurityRequirement(new OpenApiSecurityRequirement
-    {
-        {
-            new OpenApiSecurityScheme { Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" } },
-            Array.Empty<string>()
-        }
-    });
+// Every data operation goes through the Part 2 API.
+var baseUrl = (builder.Configuration["Api:BaseUrl"] ?? "http://localhost:5080/").TrimEnd('/') + "/";
+builder.Services.AddHttpClient<ApiClient>(c =>
+{
+    c.BaseAddress = new Uri(baseUrl);
+    c.Timeout = TimeSpan.FromSeconds(30);
 });
 
 var app = builder.Build();
 
-// Code-first: create the database from the EF Core model on startup if it doesn't exist.
-// (Works for SQL Server and for the in-memory database used by the tests.)
-using (var scope = app.Services.CreateScope())
+if (!app.Environment.IsDevelopment())
 {
-    var db = scope.ServiceProvider.GetRequiredService<RaceDayDbContext>();
-    db.Database.EnsureCreated();
+    app.UseExceptionHandler("/Home/Error");
 }
+app.UseStatusCodePagesWithReExecute("/Home/Error", "?code={0}");
 
-app.UseSwagger();
-app.UseSwaggerUI(c => { c.SwaggerEndpoint("/swagger/v1/swagger.json", "RaceDay API v1"); c.RoutePrefix = "swagger"; });
+app.UseStaticFiles();
+app.UseRouting();
+app.UseSession();
 
-app.UseAuthentication();
-app.UseAuthorization();
-app.MapControllers();
-app.MapGet("/", () => Results.Redirect("/swagger")).ExcludeFromDescription();
+app.MapControllerRoute("default", "{controller=Home}/{action=Index}/{id?}");
 app.Run();
 
-public partial class Program { }
+internal static class ServiceExtensions
+{
+    public static IServiceCollection AddControllersViews(this IServiceCollection services)
+    {
+        services.AddControllersWithViews(o =>
+        {
+            o.Filters.Add(new AutoValidateAntiforgeryTokenAttribute());
+            o.Filters.Add<ApiExceptionFilter>();
+        });
+        return services;
+    }
+}
